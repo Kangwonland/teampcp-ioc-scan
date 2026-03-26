@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# TeamPCP Supply Chain IOC Scanner v1.0
+# TeamPCP Supply Chain IOC Scanner v1.1.0
 # Campaign: March 19-24, 2026
 #
 # Detects indicators of compromise from the TeamPCP multi-ecosystem
@@ -12,7 +12,14 @@
 # =============================================================================
 
 set +e  # Don't exit on individual command failures
-VERSION="1.0.0"
+VERSION="1.1.0"
+
+# Require bash 4+ for associative arrays (declare -A)
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    printf "Error: bash 4.0+ required (current: %s)\n" "$BASH_VERSION" >&2
+    printf "  On macOS: brew install bash && /usr/local/bin/bash %s\n" "$0" >&2
+    exit 2
+fi
 
 # =============================================================================
 # COLOR CONSTANTS
@@ -71,6 +78,9 @@ MALICIOUS_FILES_ABSOLUTE=(
 # Systemd service names
 SYSTEMD_SERVICES=("sysmon" "pgmon" "internal-monitor" "pgmonitor")
 
+# Malicious process names to check
+MALICIOUS_PROCESSES=("sysmon.py" "pgmon" "pgmon.py" "service.py" "pglog" "runner.py")
+
 # SHA256 hashes - malicious files
 declare -A FILE_HASHES=(
     ["litellm_init.pth"]="71e35aef03099cd1f2d6446734273025a163597de93912df321ef118bf135238"
@@ -96,6 +106,13 @@ NPM_WORM_DEPLOY_HASHES=(
 declare -A DOCKER_IMAGE_SHAS=(
     ["aquasec/trivy:0.69.5"]="f69a8a4180c43fc427532ddde34a256acbd041a0a07844cf7e4d3e0434e5bcd1"
     ["aquasec/trivy:0.69.6"]="dd8beb3b40df080b3fd7f9a0f5a1b02f3692f65c68980f46da8328ce8bb788ef"
+)
+
+# Trivy binary SHAs (v0.69.4)
+declare -A TRIVY_BINARY_HASHES=(
+    ["Linux-64"]="822dd269ec10459572dfaaefe163dae693c344249a0161953f0d5cdd110bd2a0"
+    ["macOS-ARM64"]="6328a34b26a63423b555a61f89a6a0525a534e9c88584c815d937910f1ddd538"
+    ["Windows-64"]="0880819ef821cff918960a39c1c1aada55a5593c61c608ea9215da858a86e349"
 )
 
 # Malicious Docker images
@@ -132,7 +149,6 @@ NPM_MALICIOUS_PACKAGES=(
 )
 
 # @teale.io/eslint-config malicious versions
-# TODO: Implement version-specific checking for @teale.io/eslint-config in npm scanner
 TEALE_MALICIOUS_VERSIONS=("1.8.9" "1.8.10" "1.8.11" "1.8.12" "1.8.13" "1.8.14" "1.8.15" "1.8.16")
 
 # Attribution strings to search for
@@ -168,8 +184,21 @@ LOG_PATH=""
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# Portable timeout: use coreutils timeout if available, otherwise run without timeout
+if ! cmd_exists timeout; then
+    timeout() { shift; "$@"; }
+fi
+
 json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr '\n' ' '
+    printf '%s' "$1" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/"/\\"/g' \
+        -e 's/\t/\\t/g' \
+        -e 's/\r/\\r/g' \
+        -e "s/$(printf '\b')/\\\\b/g" \
+        -e "s/$(printf '\f')/\\\\f/g" | \
+        tr '\n' ' ' | \
+        tr -d '\000-\010\013\014\016-\037'
 }
 
 compute_sha256() {
@@ -270,13 +299,35 @@ should_run_scanner() {
     return 1
 }
 
+resolve_path() {
+    if cmd_exists realpath; then
+        realpath "$1" 2>/dev/null && return
+    fi
+    if cmd_exists readlink; then
+        readlink -f "$1" 2>/dev/null && return
+    fi
+    # Last resort: use pwd for relative paths
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s/%s' "$(pwd)" "$1" ;;
+    esac
+}
+
+# Cache resolved path of this script (computed once)
+_SCRIPT_REAL_PATH=""
+_get_script_real_path() {
+    if [ -z "$_SCRIPT_REAL_PATH" ]; then
+        _SCRIPT_REAL_PATH=$(resolve_path "${BASH_SOURCE[0]}")
+    fi
+    printf '%s' "$_SCRIPT_REAL_PATH"
+}
+
 check_file_for_c2() {
     local file="$1"
     # Skip this scanner script itself to avoid self-detection
-    local script_real file_real
-    script_real=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null) || script_real="${BASH_SOURCE[0]}"
-    file_real=$(realpath "$file" 2>/dev/null) || file_real="$file"
-    [ "$file_real" = "$script_real" ] && return 1
+    local file_real
+    file_real=$(resolve_path "$file")
+    [ "$file_real" = "$(_get_script_real_path)" ] && return 1
     for sig in "${C2_CONTENT_SIGNATURES[@]}"; do
         if command grep -q "$sig" "$file" 2>/dev/null; then
             return 0
@@ -306,12 +357,19 @@ scan_filesystem() {
                 add_json_finding "filesystem" "high" "Suspicious file: $fullpath" "Path matches IOC but no C2 signatures" "Inspect and remove"
                 ((findings++))
             fi
-            [ -L "$fullpath" ] && log_info "  (symlink -> $(readlink -f "$fullpath"))"
+            [ -L "$fullpath" ] && log_info "  (symlink -> $(resolve_path "$fullpath"))"
         fi
     done
 
     # Check absolute paths
     for abspath in "${MALICIOUS_FILES_ABSOLUTE[@]}"; do
+        local parent_dir
+        parent_dir=$(dirname "$abspath")
+        if [ ! -r "$parent_dir" ]; then
+            log_skip "Cannot read $parent_dir (permission denied) - run as root to check $abspath"
+            add_json_finding "filesystem" "info" "Skipped: $abspath" "Permission denied on $parent_dir" "Re-run as root"
+            continue
+        fi
         if [ -f "$abspath" ]; then
             if check_file_for_c2 "$abspath"; then
                 log_critical "Found $abspath" "Contains C2 domain references - confirmed malicious" "Delete: rm -f '$abspath'"
@@ -327,9 +385,10 @@ scan_filesystem() {
     # Search for litellm_init.pth in all Python site-packages
     log_verbose "Searching for litellm_init.pth in site-packages..."
     local pth_found=0
-    local search_dirs=(/usr/lib/python3* /usr/local/lib/python3* "${HOME}/.local/lib/python3*")
-    # Add conda/venv paths
-    for d in "${HOME}/miniconda3" "${HOME}/anaconda3" "${HOME}/mambaforge" "${HOME}/.conda"; do
+    local search_dirs=(/usr/lib/python3* /usr/lib64/python3* /usr/local/lib/python3* "${HOME}/.local/lib/python3*")
+    # Add conda/venv/pyenv/opt paths
+    for d in "${HOME}/miniconda3" "${HOME}/anaconda3" "${HOME}/mambaforge" "${HOME}/.conda" \
+             "${HOME}/.pyenv/versions"/*/lib/python3* /opt/python*/lib/python3* /opt/venv/*/lib/python3*; do
         [ -d "$d" ] && search_dirs+=("$d")
     done
 
@@ -394,6 +453,27 @@ scan_filesystem() {
 
     [ "$proxy_found" -eq 0 ] && log_clean "No malicious proxy_server.py found"
 
+    # Check for malicious trivy binary
+    log_verbose "Checking trivy binary hash..."
+    local trivy_path=""
+    trivy_path=$(command -v trivy 2>/dev/null)
+    if [ -n "$trivy_path" ]; then
+        local hash trivy_malicious=0
+        hash=$(compute_sha256 "$trivy_path")
+        if [ "$hash" != "NO_HASH_TOOL" ]; then
+            for known_hash in "${TRIVY_BINARY_HASHES[@]}"; do
+                if [ "$hash" = "$known_hash" ]; then
+                    log_critical "Malicious trivy binary: $trivy_path" "SHA256 matches compromised v0.69.4" "Remove and reinstall from official source"
+                    add_json_finding "filesystem" "critical" "Malicious trivy binary" "SHA256: $hash at $trivy_path" "Reinstall trivy"
+                    ((findings++))
+                    trivy_malicious=1
+                    break
+                fi
+            done
+            [ "$trivy_malicious" -eq 0 ] && log_clean "trivy binary is safe ($trivy_path)"
+        fi
+    fi
+
     # Check systemd services
     log_verbose "Checking systemd services..."
     local svc_found=0
@@ -414,10 +494,94 @@ scan_filesystem() {
     done
     [ "$svc_found" -eq 0 ] && log_clean "No suspicious systemd services"
 
-    # Check for container environment
-    if [ -f "/.dockerenv" ] || command grep -q "docker\|containerd" /proc/1/cgroup 2>/dev/null; then
-        log_info "Running inside a container" "Some host-level checks may be incomplete"
+    # Check for running malicious processes
+    log_verbose "Checking for running malicious processes..."
+    local proc_found=0
+    local ps_output
+    ps_output=$(ps aux 2>/dev/null || ps -ef 2>/dev/null)
+    if [ -n "$ps_output" ]; then
+        for proc_name in "${MALICIOUS_PROCESSES[@]}"; do
+            local proc_matches
+            proc_matches=$(echo "$ps_output" | command grep -v "grep" | command grep -v "teampcp_scan" | command grep -w "$proc_name" 2>/dev/null)
+            if [ -n "$proc_matches" ]; then
+                local pids
+                pids=$(echo "$proc_matches" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+                log_critical "Malicious process running: $proc_name (PIDs: $pids)" \
+                    "$(echo "$proc_matches" | head -3)" \
+                    "Kill immediately: kill -9 $pids"
+                add_json_finding "filesystem" "critical" "Malicious process: $proc_name" "PIDs: $pids" "kill -9 $pids"
+                ((findings++))
+                proc_found=1
+            fi
+        done
+        [ "$proc_found" -eq 0 ] && log_clean "No malicious processes running"
+    else
+        log_skip "Unable to list processes (ps not available)"
     fi
+
+    # Search for WAV steganography files (CanisterWorm v3.3)
+    log_verbose "Searching for WAV steganography files..."
+    local wav_found=0
+    for wav_name in "bg_kube.wav" "bg_prop.wav"; do
+        while IFS= read -r wav_file; do
+            [ -z "$wav_file" ] && continue
+            log_critical "Steganography WAV file found: $wav_file" \
+                "CanisterWorm v3.3 hides Base64-encoded Python payload in WAV files" \
+                "Delete: rm -f '$wav_file'"
+            add_json_finding "filesystem" "critical" "Steganography WAV: $wav_name" "$wav_file" "rm -f $wav_file"
+            ((findings++))
+            wav_found=1
+        done < <(timeout 30 find "$SCAN_PATH" -name "$wav_name" -not -path "*/.git/*" 2>/dev/null | head -20)
+    done
+    [ "$wav_found" -eq 0 ] && log_clean "No steganography WAV files found"
+
+    # Broad content scan: search files in SCAN_PATH for C2/attribution signatures
+    # Detects contaminated delivered software where malicious code is in built artifacts
+    log_verbose "Broad content scan of $SCAN_PATH for IOC strings..."
+    local content_found=0
+    local broad_pattern=""
+    for attr in "${ATTRIBUTION_STRINGS[@]}"; do
+        local escaped
+        escaped=$(printf '%s' "$attr" | sed 's/[].[\\*^$()+?{|}/\-]/\\&/g')
+        if [ -z "$broad_pattern" ]; then
+            broad_pattern="$escaped"
+        else
+            broad_pattern="${broad_pattern}|${escaped}"
+        fi
+    done
+    for sig in "${C2_CONTENT_SIGNATURES[@]}"; do
+        broad_pattern="${broad_pattern}|$(printf '%s' "$sig" | sed 's/[].[\\*^$()+?{|}/\-]/\\&/g')"
+    done
+
+    local script_self
+    script_self=$(_get_script_real_path)
+    while IFS= read -r match_file; do
+        [ -z "$match_file" ] && continue
+        local file_resolved
+        file_resolved=$(resolve_path "$match_file")
+        [ "$file_resolved" = "$script_self" ] && continue
+        case "$(basename "$match_file")" in
+            ANALYSIS.md|README.md|teampcp_scan.sh) continue ;;
+        esac
+        local matched_sigs
+        matched_sigs=$(command grep -oE "$broad_pattern" "$match_file" 2>/dev/null | sort -u | head -5 | tr '\n' ', ' | sed 's/,$//')
+        log_high "IOC content detected in: $match_file" \
+            "Matched: $matched_sigs" \
+            "Inspect file for malicious code or contaminated build artifacts"
+        add_json_finding "filesystem" "high" "IOC content in $match_file" "Matched: $matched_sigs" "Inspect file"
+        ((findings++))
+        content_found=1
+    done < <(timeout 60 find "$SCAN_PATH" -type f \
+        -size +10c -size -10M \
+        -not -path "*/.git/*" \
+        -not -path "*/node_modules/.cache/*" \
+        -not -name "*.whl" -not -name "*.tar.gz" -not -name "*.zip" \
+        -not -name "*.png" -not -name "*.jpg" -not -name "*.gif" -not -name "*.ico" \
+        -not -name "*.woff" -not -name "*.woff2" -not -name "*.ttf" -not -name "*.eot" \
+        -not -name "*.mp4" -not -name "*.mp3" -not -name "*.wav" \
+        -not -name "*.pdf" -not -name "*.exe" -not -name "*.dll" -not -name "*.so" \
+        -exec command grep -lE "$broad_pattern" {} \; 2>/dev/null | head -50)
+    [ "$content_found" -eq 0 ] && log_clean "No IOC content signatures found in SCAN_PATH"
 
     local duration=$(( $(date +%s) - start_time ))
     add_json_scanner_result "filesystem" "$([ "$findings" -gt 0 ] && echo found || echo clean)" "$duration" "$findings"
@@ -434,10 +598,13 @@ scan_pypi() {
     local litellm_found=0
 
     # Method 1: Try pip list commands
-    for pip_cmd in "pip" "pip3" "python3 -m pip" "python -m pip"; do
+    local pip_cmds=("pip" "pip3" "python3 -m pip" "python -m pip")
+    for pip_cmd in "${pip_cmds[@]}"; do
+        # shellcheck disable=SC2086
         if $pip_cmd --version >/dev/null 2>&1; then
             log_verbose "Checking via: $pip_cmd list"
             local version
+            # shellcheck disable=SC2086
             version=$($pip_cmd list --format=columns 2>/dev/null | command grep -i "^litellm " | awk '{print $2}')
             if [ -n "$version" ]; then
                 if [ "$version" = "1.82.7" ] || [ "$version" = "1.82.8" ]; then
@@ -470,8 +637,14 @@ scan_pypi() {
 
     # Method 3: Check pip cache for malicious wheels/tarballs
     log_verbose "Checking pip cache..."
-    local cache_dirs=("${HOME}/.cache/pip" "/tmp/pip-*")
+    local cache_dirs=("${HOME}/.cache/pip")
+    # Expand /tmp/pip-* glob into the array (glob may match nothing)
+    local tmp_pip_dirs=(/tmp/pip-*)
+    for d in "${tmp_pip_dirs[@]}"; do
+        [ -d "$d" ] && cache_dirs+=("$d")
+    done
     for cache_dir in "${cache_dirs[@]}"; do
+        [ -d "$cache_dir" ] || continue
         while IFS= read -r cached; do
             [ -z "$cached" ] && continue
             local hash
@@ -487,7 +660,7 @@ scan_pypi() {
                     ((findings++))
                     ;;
             esac
-        done < <(find $cache_dir -name "litellm-1.82.*" 2>/dev/null)
+        done < <(find "$cache_dir" -name "litellm-1.82.*" 2>/dev/null)
     done
 
     if [ "$litellm_found" -eq 0 ] && [ "$findings" -eq 0 ]; then
@@ -550,11 +723,17 @@ scan_npm() {
         log_skip "npm/pnpm not installed - checking filesystem directly"
     fi
 
-    # Method 2: Scan lock files for malicious package names
+    # Method 2: Scan lock files for malicious package names and version-specific checks
     log_verbose "Scanning lock files in $SCAN_PATH..."
     local lock_findings=0
+    local lockfile_list=()
     while IFS= read -r lockfile; do
         [ -z "$lockfile" ] && continue
+        lockfile_list+=("$lockfile")
+    done < <(timeout 60 find "$SCAN_PATH" \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" \) \
+        -not -path "*/node_modules/*" 2>/dev/null | head -100)
+
+    for lockfile in "${lockfile_list[@]}"; do
         log_verbose "Checking: $lockfile"
         local matches
         matches=$(command grep -nE "$npm_pattern" "$lockfile" 2>/dev/null | head -20)
@@ -564,10 +743,148 @@ scan_npm() {
             ((findings++))
             ((lock_findings++))
         fi
-    done < <(timeout 60 find "$SCAN_PATH" \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" \) \
-        -not -path "*/node_modules/*" 2>/dev/null | head -100)
+
+        # Version-specific checks for named packages
+        for pkg_ver in "${NPM_MALICIOUS_PACKAGES[@]}"; do
+            local pkg="${pkg_ver%%:*}"
+            local mal_ver="${pkg_ver##*:}"
+            if command grep -q "\"${pkg}\".*\"${mal_ver}\"\\|\"${pkg}@${mal_ver}\"" "$lockfile" 2>/dev/null; then
+                log_critical "Malicious package+version in lockfile: ${pkg}@${mal_ver}" \
+                    "File: $lockfile" \
+                    "Remove package, update to safe version, regenerate lockfile"
+                add_json_finding "npm" "critical" "Malicious ${pkg}@${mal_ver} in lockfile" "$lockfile" "Remove and regenerate lockfile"
+                ((findings++))
+                ((lock_findings++))
+            fi
+        done
+    done
 
     [ "$lock_findings" -eq 0 ] && log_clean "No malicious packages in lock files"
+
+    # Method 2b: Scan SBOM files for malicious package references
+    log_verbose "Scanning SBOM files..."
+    local sbom_found=0
+    while IFS= read -r sbom_file; do
+        [ -z "$sbom_file" ] && continue
+        local matches
+        matches=$(command grep -nE "$npm_pattern" "$sbom_file" 2>/dev/null | head -10)
+        if [ -n "$matches" ]; then
+            log_high "Malicious package reference in SBOM: $sbom_file" \
+                "$(echo "$matches" | head -3)" \
+                "Investigate build pipeline -- malicious dependency was included"
+            add_json_finding "npm" "high" "Malicious package in SBOM" "$sbom_file" "Investigate build pipeline"
+            ((findings++))
+            sbom_found=1
+        fi
+    done < <(timeout 30 find "$SCAN_PATH" \
+        \( -name "bom.json" -o -name "sbom.json" -o -name "*.cdx.json" -o -name "*.spdx.json" -o -name "*.spdx" \) \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -50)
+    [ "$sbom_found" -eq 0 ] && log_clean "No malicious packages in SBOM files"
+
+    # Method 2c: Scan license aggregation files
+    log_verbose "Scanning license aggregation files..."
+    local license_found=0
+    while IFS= read -r lic_file; do
+        [ -z "$lic_file" ] && continue
+        local matches
+        matches=$(command grep -nE "$npm_pattern" "$lic_file" 2>/dev/null | head -10)
+        if [ -n "$matches" ]; then
+            log_high "Malicious package in license file: $lic_file" \
+                "$(echo "$matches" | head -3)" \
+                "A malicious dependency was bundled -- audit the build"
+            add_json_finding "npm" "high" "Malicious package in license file" "$lic_file" "Audit build pipeline"
+            ((findings++))
+            license_found=1
+        fi
+    done < <(timeout 30 find "$SCAN_PATH" \
+        \( -iname "third-party-licenses*" -o -iname "licenses.txt" -o -name "NOTICE" -o -iname "third_party_licenses*" \) \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -30)
+    [ "$license_found" -eq 0 ] && log_clean "No malicious packages in license files"
+
+    # Method 2d: Scan source maps for malicious package paths
+    log_verbose "Scanning source maps for malicious package references..."
+    local srcmap_found=0
+    local srcmap_pattern=""
+    for scope in "${NPM_MALICIOUS_SCOPES[@]}"; do
+        if [ -z "$srcmap_pattern" ]; then
+            srcmap_pattern="node_modules/${scope}/"
+        else
+            srcmap_pattern="${srcmap_pattern}|node_modules/${scope}/"
+        fi
+    done
+    for pkg_ver in "${NPM_MALICIOUS_PACKAGES[@]}"; do
+        local pkg="${pkg_ver%%:*}"
+        srcmap_pattern="${srcmap_pattern}|node_modules/${pkg}/"
+    done
+    while IFS= read -r map_file; do
+        [ -z "$map_file" ] && continue
+        local matches
+        matches=$(command grep -oE "$srcmap_pattern" "$map_file" 2>/dev/null | sort -u | head -5)
+        if [ -n "$matches" ]; then
+            log_high "Malicious package path in source map: $map_file" \
+                "References: $(echo "$matches" | tr '\n' ', ' | sed 's/,$//')" \
+                "Build artifact contains code from compromised package"
+            add_json_finding "npm" "high" "Malicious package in source map" "$map_file" "Rebuild without malicious dependency"
+            ((findings++))
+            srcmap_found=1
+        fi
+    done < <(timeout 45 find "$SCAN_PATH" -name "*.js.map" \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" \
+        -size -50M 2>/dev/null | head -30)
+    [ "$srcmap_found" -eq 0 ] && log_clean "No malicious packages in source maps"
+
+    # Method 2e: Scan JS bundles for malicious package banner comments
+    log_verbose "Scanning JS bundles for malicious package banner comments..."
+    local bundle_found=0
+    local banner_pattern=""
+    for scope in "${NPM_MALICIOUS_SCOPES[@]}"; do
+        if [ -z "$banner_pattern" ]; then
+            banner_pattern="/\\*!.*${scope}/"
+        else
+            banner_pattern="${banner_pattern}|/\\*!.*${scope}/"
+        fi
+    done
+    for pkg_ver in "${NPM_MALICIOUS_PACKAGES[@]}"; do
+        local pkg="${pkg_ver%%:*}"
+        local pkg_escaped="${pkg//\//\\/}"
+        banner_pattern="${banner_pattern}|/\\*!.*${pkg_escaped}"
+    done
+    while IFS= read -r js_file; do
+        [ -z "$js_file" ] && continue
+        local matches
+        matches=$(command grep -nE "$banner_pattern" "$js_file" 2>/dev/null | head -5)
+        if [ -n "$matches" ]; then
+            log_high "Malicious package banner in JS bundle: $js_file" \
+                "$(echo "$matches" | head -2)" \
+                "Bundle was built with compromised dependency"
+            add_json_finding "npm" "high" "Malicious package banner in bundle" "$js_file" "Rebuild without malicious dependency"
+            ((findings++))
+            bundle_found=1
+        fi
+    done < <(timeout 45 find "$SCAN_PATH" \( -name "*.min.js" -o -name "*.bundle.js" -o -name "chunk-*.js" -o -name "vendor*.js" -o -name "main.*.js" \) \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" \
+        -size -50M 2>/dev/null | head -30)
+    [ "$bundle_found" -eq 0 ] && log_clean "No malicious package banners in JS bundles"
+
+    # Method 2f: Scan webpack/build manifests
+    log_verbose "Scanning build manifests..."
+    local manifest_found=0
+    while IFS= read -r manifest; do
+        [ -z "$manifest" ] && continue
+        local matches
+        matches=$(command grep -nE "$npm_pattern" "$manifest" 2>/dev/null | head -10)
+        if [ -n "$matches" ]; then
+            log_high "Malicious package reference in build manifest: $manifest" \
+                "$(echo "$matches" | head -3)" \
+                "Build included compromised package"
+            add_json_finding "npm" "high" "Malicious package in build manifest" "$manifest" "Rebuild without malicious dependency"
+            ((findings++))
+            manifest_found=1
+        fi
+    done < <(timeout 30 find "$SCAN_PATH" \
+        \( -name "asset-manifest.json" -o -name "stats.json" -o -name "webpack-stats.json" -o -name "build-manifest.json" \) \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -20)
+    [ "$manifest_found" -eq 0 ] && log_clean "No malicious packages in build manifests"
 
     # Method 3: Check for npm worm indicators in node_modules
     log_verbose "Scanning node_modules for worm indicators..."
@@ -616,6 +933,7 @@ scan_npm() {
             fi
         fi
     done < <(timeout 60 find "$SCAN_PATH" -maxdepth 6 -path "*/node_modules/*/package.json" 2>/dev/null | head -500)
+    [ "$worm_found" -eq 0 ] && log_clean "No npm worm indicators in node_modules"
 
     # Method 4: Search for worm function signatures in JS files
     log_verbose "Searching for npm worm function signatures..."
@@ -628,6 +946,24 @@ scan_npm() {
         ((findings++))
     done < <(timeout 30 find "$SCAN_PATH" -path "*/node_modules/*" \( -name "index.js" -o -name "deploy.js" \) \
         -exec command grep -lE "$func_pattern" {} \; 2>/dev/null | head -20)
+
+    # Method 5: Check @teale.io/eslint-config versions in node_modules
+    log_verbose "Checking @teale.io/eslint-config versions..."
+    while IFS= read -r pkg_json; do
+        [ -z "$pkg_json" ] && continue
+        local version
+        version=$(command grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$pkg_json" 2>/dev/null | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/"//')
+        for mal_ver in "${TEALE_MALICIOUS_VERSIONS[@]}"; do
+            if [ "$version" = "$mal_ver" ]; then
+                local pkg_dir
+                pkg_dir=$(dirname "$pkg_json")
+                log_critical "Malicious @teale.io/eslint-config v${version}: $pkg_dir" "Known compromised version" "rm -rf '$pkg_dir' and update dependencies"
+                add_json_finding "npm" "critical" "Malicious @teale.io/eslint-config v${version}" "$pkg_dir" "Remove and update"
+                ((findings++))
+                break
+            fi
+        done
+    done < <(timeout 30 find "$SCAN_PATH" -path "*/node_modules/@teale.io/eslint-config/package.json" 2>/dev/null)
 
     # Also check .yarn/cache
     if [ -d "${SCAN_PATH}/.yarn/cache" ]; then
@@ -643,6 +979,98 @@ scan_npm() {
                 ((findings++))
             fi
         done
+    fi
+
+    # Method 6: Search for BASE64_PAYLOAD constant (CanisterWorm Python backdoor carrier)
+    log_verbose "Searching for BASE64_PAYLOAD constant..."
+    local b64_found=0
+    local b64_script_self
+    b64_script_self=$(_get_script_real_path)
+    while IFS= read -r b64_file; do
+        [ -z "$b64_file" ] && continue
+        local b64_resolved
+        b64_resolved=$(resolve_path "$b64_file")
+        [ "$b64_resolved" = "$b64_script_self" ] && continue
+        log_critical "BASE64_PAYLOAD constant found: $b64_file" \
+            "CanisterWorm embeds Python backdoor as BASE64_PAYLOAD" \
+            "Inspect and remove the package containing this file"
+        add_json_finding "npm" "critical" "BASE64_PAYLOAD in $b64_file" "CanisterWorm Python backdoor constant" "Remove package"
+        ((findings++))
+        b64_found=1
+    done < <(timeout 30 find "$SCAN_PATH" \( -name "*.js" -o -name "*.py" \) \
+        -not -path "*/node_modules/.cache/*" -not -path "*/.git/*" \
+        -exec command grep -l "BASE64_PAYLOAD" {} \; 2>/dev/null | head -20)
+    [ "$b64_found" -eq 0 ] && log_clean "No BASE64_PAYLOAD constants found"
+
+    # Method 7: Check for .npmrc token exposure
+    log_verbose "Checking for .npmrc files with tokens..."
+    local npmrc_found=0
+    local npmrc_paths=("${HOME}/.npmrc")
+    while IFS= read -r npmrc; do
+        [ -z "$npmrc" ] && continue
+        npmrc_paths+=("$npmrc")
+    done < <(timeout 15 find "$SCAN_PATH" -name ".npmrc" -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -20)
+    for npmrc_file in "${npmrc_paths[@]}"; do
+        [ -f "$npmrc_file" ] || continue
+        if command grep -qE '_authToken|_auth|//registry.*:' "$npmrc_file" 2>/dev/null; then
+            log_medium ".npmrc with auth tokens found: $npmrc_file" \
+                "CanisterWorm harvests npm tokens from .npmrc. If compromised, rotate tokens immediately."
+            add_json_finding "npm" "medium" ".npmrc token exposure: $npmrc_file" \
+                "Contains auth tokens that may have been stolen" \
+                "npm token revoke <token> && npm login"
+            ((findings++))
+            npmrc_found=1
+        fi
+    done
+    [ "$npmrc_found" -eq 0 ] && log_verbose "No .npmrc files with tokens found"
+
+    # Method 8: Check npm cache for malicious packages
+    local npm_cache_dir="${HOME}/.npm/_cacache"
+    if [ -d "$npm_cache_dir" ]; then
+        log_verbose "Checking npm cache at $npm_cache_dir..."
+        local cache_found=0
+        local cache_index_dir="${npm_cache_dir}/index-v5"
+        if [ -d "$cache_index_dir" ]; then
+            local cache_pattern=""
+            for scope in "${NPM_MALICIOUS_SCOPES[@]}"; do
+                if [ -z "$cache_pattern" ]; then
+                    cache_pattern="${scope}/"
+                else
+                    cache_pattern="${cache_pattern}|${scope}/"
+                fi
+            done
+            for pkg_ver in "${NPM_MALICIOUS_PACKAGES[@]}"; do
+                local pkg="${pkg_ver%%:*}"
+                cache_pattern="${cache_pattern}|${pkg}"
+            done
+            local cache_hits
+            cache_hits=$(timeout 30 find "$cache_index_dir" -type f \
+                -exec command grep -l -E "$cache_pattern" {} \; 2>/dev/null | head -10)
+            if [ -n "$cache_hits" ]; then
+                log_high "Malicious package references in npm cache" \
+                    "Found in: $(echo "$cache_hits" | head -3)" \
+                    "Clear npm cache: npm cache clean --force"
+                add_json_finding "npm" "high" "Malicious packages in npm cache" "$cache_hits" "npm cache clean --force"
+                ((findings++))
+                cache_found=1
+            fi
+        fi
+        local content_dir="${npm_cache_dir}/content-v2"
+        if [ -d "$content_dir" ]; then
+            while IFS= read -r cache_entry; do
+                [ -z "$cache_entry" ] && continue
+                log_high "npm cache entry contains worm signatures: $cache_entry" \
+                    "CanisterWorm function names detected" \
+                    "npm cache clean --force"
+                add_json_finding "npm" "high" "Worm signatures in npm cache" "$cache_entry" "npm cache clean --force"
+                ((findings++))
+                cache_found=1
+            done < <(timeout 30 find "$content_dir" -type f -size +100c -size -500k \
+                -exec command grep -l -E "findNpmTokens|bumpPatch|getOwnedPackages|deployWithToken" {} \; 2>/dev/null | head -5)
+        fi
+        [ "$cache_found" -eq 0 ] && log_clean "npm cache clean of malicious packages"
+    else
+        log_verbose "npm cache directory not found at $npm_cache_dir"
     fi
 
     local duration=$(( $(date +%s) - start_time ))
@@ -1161,14 +1589,14 @@ scan_openvsx() {
 
 print_banner() {
     [ "$QUIET" -eq 1 ] && return
-    printf "\n${BOLD}"
+    printf '\n%s' "$BOLD"
     printf '%.0s=' {1..66}
     printf "\n  TeamPCP Supply Chain IOC Scanner v%s\n" "$VERSION"
     printf "  Campaign: March 19-24, 2026\n"
     printf "  Scan started: %s\n" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     printf "  Scan path: %s\n" "$SCAN_PATH"
     printf '%.0s=' {1..66}
-    printf "${RESET}\n"
+    printf '%s\n' "$RESET"
 }
 
 print_summary() {
@@ -1187,14 +1615,14 @@ print_summary() {
         status_color="${CYAN}"
     fi
 
-    printf "\n${BOLD}"
+    printf '\n%s' "$BOLD"
     printf '%.0s=' {1..66}
     printf "\n  SCAN COMPLETE | Duration: %ss\n" "$duration"
     printf "  Findings: %s critical, %s high, %s medium, %s info\n" \
         "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MEDIUM" "$TOTAL_INFO"
-    printf "  Status: ${status_color}%s${RESET}${BOLD}\n" "$status"
+    printf "  Status: %s%s%s%s\n" "$status_color" "$status" "$RESET" "$BOLD"
     printf '%.0s=' {1..66}
-    printf "${RESET}\n\n"
+    printf '%s\n\n' "$RESET"
 }
 
 write_json_report() {
@@ -1206,10 +1634,11 @@ write_json_report() {
     [ "$TOTAL_CRITICAL" -gt 0 ] && status="compromised"
     [ "$TOTAL_CRITICAL" -eq 0 ] && [ "$TOTAL_HIGH" -gt 0 ] && status="suspicious"
 
-    local escaped_scan_path escaped_hostname escaped_scanners
+    local escaped_scan_path escaped_hostname escaped_scanners escaped_platform
     escaped_scan_path=$(json_escape "$SCAN_PATH")
     escaped_hostname=$(json_escape "$(hostname)")
     escaped_scanners=$(json_escape "$SCANNERS_TO_RUN")
+    escaped_platform=$(json_escape "$(uname -s)")
 
     cat > "$JSON_OUTPUT" << JSONEOF
 {
@@ -1220,7 +1649,7 @@ write_json_report() {
     "scan_timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
     "scan_duration_sec": ${duration},
     "hostname": "${escaped_hostname}",
-    "platform": "$(uname -s)",
+    "platform": "${escaped_platform}",
     "scan_path": "${escaped_scan_path}",
     "scanners_run": "${escaped_scanners}"
   },
@@ -1247,7 +1676,7 @@ JSONEOF
 # =============================================================================
 show_help() {
     cat << 'HELPEOF'
-TeamPCP Supply Chain IOC Scanner v1.0
+TeamPCP Supply Chain IOC Scanner v1.1.0
 Campaign: March 19-24, 2026
 
 Detects indicators of compromise from the TeamPCP multi-ecosystem supply chain
@@ -1304,7 +1733,8 @@ main() {
     parse_args "$@"
     SCAN_START=$(date +%s)
 
-    # Validate scan path
+    # Validate and resolve scan path
+    SCAN_PATH=$(resolve_path "$SCAN_PATH")
     if [ ! -d "$SCAN_PATH" ]; then
         printf "${RED}Error: Scan path does not exist: %s${RESET}\n" "$SCAN_PATH"
         exit 1
@@ -1333,7 +1763,22 @@ main() {
 
     # Detect environment
     if [ -f "/.dockerenv" ] || command grep -q "docker\|containerd\|lxc" /proc/1/cgroup 2>/dev/null; then
-        [ "$QUIET" -eq 0 ] && printf "${YELLOW}Note: Running inside a container. Some host-level checks may be limited.${RESET}\n"
+        [ "$QUIET" -eq 0 ] && printf '%sNote: Running inside a container. Some host-level checks may be limited.%s\n' "$YELLOW" "$RESET"
+    fi
+
+    # Warn about insufficient privileges
+    if [ "$(id -u)" -ne 0 ]; then
+        [ "$QUIET" -eq 0 ] && printf '%sWarning: Running without root. Some checks will be incomplete:%s\n' "$YELLOW" "$RESET"
+        local perm_warnings=()
+        [ ! -r "/etc/systemd/system/" ] 2>/dev/null && perm_warnings+=("systemd unit files")
+        [ ! -r "/var/lib/" ] 2>/dev/null && perm_warnings+=("/var/lib persistence paths")
+        ! ss -tunp >/dev/null 2>&1 && perm_warnings+=("network process info (ss -tunp)")
+        if [ ${#perm_warnings[@]} -gt 0 ]; then
+            for pw in "${perm_warnings[@]}"; do
+                [ "$QUIET" -eq 0 ] && printf '  %s- %s%s\n' "$DIM" "$pw" "$RESET"
+            done
+        fi
+        [ "$QUIET" -eq 0 ] && printf '%s  Run with sudo for full coverage.%s\n' "$YELLOW" "$RESET"
     fi
 
     print_banner
