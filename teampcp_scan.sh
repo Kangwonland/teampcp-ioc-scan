@@ -132,6 +132,7 @@ NPM_MALICIOUS_PACKAGES=(
 )
 
 # @teale.io/eslint-config malicious versions
+# TODO: Implement version-specific checking for @teale.io/eslint-config in npm scanner
 TEALE_MALICIOUS_VERSIONS=("1.8.9" "1.8.10" "1.8.11" "1.8.12" "1.8.13" "1.8.14" "1.8.15" "1.8.16")
 
 # Attribution strings to search for
@@ -166,6 +167,10 @@ LOG_PATH=""
 # =============================================================================
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr '\n' ' '
+}
 
 compute_sha256() {
     local file="$1"
@@ -226,9 +231,9 @@ print_section() {
 add_json_finding() {
     local scanner="$1" severity="$2" title="$3" details="$4" remediation="$5"
     local escaped_title escaped_details escaped_remediation
-    escaped_title=$(echo "$title" | sed 's/"/\\"/g; s/\\/\\\\/g')
-    escaped_details=$(echo "$details" | sed 's/"/\\"/g; s/\\/\\\\/g')
-    escaped_remediation=$(echo "$remediation" | sed 's/"/\\"/g; s/\\/\\\\/g')
+    escaped_title=$(json_escape "$title")
+    escaped_details=$(json_escape "$details")
+    escaped_remediation=$(json_escape "$remediation")
     local entry
     entry=$(printf '{"scanner":"%s","severity":"%s","title":"%s","details":"%s","remediation":"%s"}' \
         "$scanner" "$severity" "$escaped_title" "$escaped_details" "$escaped_remediation")
@@ -243,8 +248,10 @@ add_json_scanner_result() {
     local scanner="$1" status="$2" duration="$3" findings="$4" reason="$5"
     local entry
     if [ -n "$reason" ]; then
+        local escaped_reason
+        escaped_reason=$(json_escape "$reason")
         entry=$(printf '{"scanner":"%s","status":"%s","duration_sec":%s,"findings_count":%s,"reason":"%s"}' \
-            "$scanner" "$status" "$duration" "$findings" "$reason")
+            "$scanner" "$status" "$duration" "$findings" "$escaped_reason")
     else
         entry=$(printf '{"scanner":"%s","status":"%s","duration_sec":%s,"findings_count":%s}' \
             "$scanner" "$status" "$duration" "$findings")
@@ -265,8 +272,13 @@ should_run_scanner() {
 
 check_file_for_c2() {
     local file="$1"
+    # Skip this scanner script itself to avoid self-detection
+    local script_real file_real
+    script_real=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null) || script_real="${BASH_SOURCE[0]}"
+    file_real=$(realpath "$file" 2>/dev/null) || file_real="$file"
+    [ "$file_real" = "$script_real" ] && return 1
     for sig in "${C2_CONTENT_SIGNATURES[@]}"; do
-        if command grep -ql "$sig" "$file" 2>/dev/null; then
+        if command grep -q "$sig" "$file" 2>/dev/null; then
             return 0
         fi
     done
@@ -325,7 +337,10 @@ scan_filesystem() {
         [ -z "$pth_file" ] && continue
         local hash
         hash=$(compute_sha256 "$pth_file")
-        if [ "$hash" = "${FILE_HASHES[litellm_init.pth]}" ]; then
+        if [ "$hash" = "NO_HASH_TOOL" ]; then
+            log_medium "Cannot verify hash (no sha256sum/shasum): $pth_file" "Install sha256sum for verification"
+            add_json_finding "filesystem" "medium" "Unverified litellm_init.pth" "No hash tool at $pth_file" "Install sha256sum"
+        elif [ "$hash" = "${FILE_HASHES[litellm_init.pth]}" ]; then
             log_critical "Found malicious litellm_init.pth: $pth_file" "SHA256 matches known malicious hash" "Delete immediately: rm -f '$pth_file'"
             add_json_finding "filesystem" "critical" "Malicious litellm_init.pth" "SHA256: $hash at $pth_file" "rm -f $pth_file"
         else
@@ -342,8 +357,16 @@ scan_filesystem() {
             [ -z "$pth_file" ] && continue
             local hash
             hash=$(compute_sha256 "$pth_file")
-            log_critical "Found litellm_init.pth in venv: $pth_file" "SHA256: $hash" "Delete: rm -f '$pth_file'"
-            add_json_finding "filesystem" "critical" "litellm_init.pth in venv" "SHA256: $hash at $pth_file" "rm -f $pth_file"
+            if [ "$hash" = "NO_HASH_TOOL" ]; then
+                log_medium "Cannot verify hash (no sha256sum/shasum): $pth_file" "Install sha256sum for verification"
+                add_json_finding "filesystem" "medium" "Unverified litellm_init.pth" "No hash tool at $pth_file" "Install sha256sum"
+            elif [ "$hash" = "${FILE_HASHES[litellm_init.pth]}" ]; then
+                log_critical "Found malicious litellm_init.pth in venv: $pth_file" "SHA256 matches known malicious hash" "Delete: rm -f '$pth_file'"
+                add_json_finding "filesystem" "critical" "Malicious litellm_init.pth" "SHA256: $hash at $pth_file" "rm -f $pth_file"
+            else
+                log_high "Found litellm_init.pth in venv: $pth_file" "SHA256: $hash (unknown - inspect manually)" "Verify this is not a malicious .pth file"
+                add_json_finding "filesystem" "high" "Suspicious litellm_init.pth in venv" "SHA256: $hash at $pth_file" "Inspect manually"
+            fi
             ((findings++))
             pth_found=1
         done < <(timeout 30 find "$SCAN_PATH" -path "*/site-packages/litellm_init.pth" 2>/dev/null)
@@ -358,7 +381,10 @@ scan_filesystem() {
         [ -z "$proxy_file" ] && continue
         local hash
         hash=$(compute_sha256 "$proxy_file")
-        if [ "$hash" = "${FILE_HASHES[proxy_server.py]}" ]; then
+        if [ "$hash" = "NO_HASH_TOOL" ]; then
+            log_medium "Cannot verify proxy_server.py hash: $proxy_file" "Install sha256sum for verification"
+            add_json_finding "filesystem" "medium" "Unverified proxy_server.py" "No hash tool at $proxy_file" "Install sha256sum"
+        elif [ "$hash" = "${FILE_HASHES[proxy_server.py]}" ]; then
             log_critical "Found malicious proxy_server.py: $proxy_file" "SHA256 matches litellm 1.82.7 injected payload" "Upgrade litellm immediately"
             add_json_finding "filesystem" "critical" "Malicious proxy_server.py" "SHA256 match at $proxy_file" "pip install --upgrade litellm"
             ((findings++))
@@ -381,6 +407,7 @@ scan_filesystem() {
         # Also check user services
         if [ -f "${HOME}/.config/systemd/user/${svc}.service" ]; then
             log_high "User systemd service found: ${svc}.service" "In ~/.config/systemd/user/" "Remove and run: systemctl --user daemon-reload"
+            add_json_finding "filesystem" "high" "User systemd service: ${svc}" "In ~/.config/systemd/user/" "Remove and daemon-reload"
             ((findings++))
             svc_found=1
         fi
@@ -449,6 +476,7 @@ scan_pypi() {
             [ -z "$cached" ] && continue
             local hash
             hash=$(compute_sha256 "$cached")
+            [ "$hash" = "NO_HASH_TOOL" ] && continue
             case "$hash" in
                 "8395c3268d5c5dbae1c7c6d4bb3c318c752ba4608cfcd90eb97ffb94a910eac2"|\
                 "d2a0d5f564628773b6af7b9c11f6b86531a875bd2d186d7081ab62748a800ebb"|\
@@ -515,6 +543,7 @@ scan_npm() {
         log_verbose "npm not found, trying pnpm..."
         pnpm ls -g --json 2>/dev/null | command grep -E "$npm_pattern" && {
             log_high "Potentially malicious packages found via pnpm global" "" "Inspect and remove"
+            add_json_finding "npm" "high" "Malicious packages via pnpm" "Global pnpm packages match IOC" "Inspect and remove"
             ((findings++))
         }
     else
@@ -586,12 +615,12 @@ scan_npm() {
                 done
             fi
         fi
-    done < <(timeout 60 find "$SCAN_PATH" -path "*/node_modules/*/package.json" -maxdepth 6 2>/dev/null | head -500)
+    done < <(timeout 60 find "$SCAN_PATH" -maxdepth 6 -path "*/node_modules/*/package.json" 2>/dev/null | head -500)
 
     # Method 4: Search for worm function signatures in JS files
     log_verbose "Searching for npm worm function signatures..."
     local func_pattern
-    func_pattern=$(printf '%s\\|' "${NPM_WORM_FUNCTIONS[@]}" | sed 's/\\|$//')
+    func_pattern=$(printf '%s|' "${NPM_WORM_FUNCTIONS[@]}" | sed 's/|$//')
     while IFS= read -r js_file; do
         [ -z "$js_file" ] && continue
         log_high "Worm function signatures found: $js_file" "Contains: findNpmTokens/bumpPatch/getOwnedPackages/deployWithToken" "Inspect and remove"
@@ -790,16 +819,20 @@ scan_github_actions() {
                     }
                 else
                     # All other refs (branch names, non-v tags) are suspicious
-                    log_critical "${wf}:${line_num} - uses: ${action}@${ref}" "Non-v-prefixed, non-0.35.0 ref - potentially compromised" "Pin to v-prefixed semver tag or verified SHA"
-                    add_json_finding "ghactions" "critical" "Suspicious trivy-action ref" "${wf}:${line_num} ref=${ref}" "Pin to safe ref"
+                    log_high "${wf}:${line_num} - uses: ${action}@${ref}" "Non-semver, non-SHA ref - verify not from compromised window (Mar 19-24, 2026)" "Pin to v-prefixed semver tag or verified SHA"
+                    add_json_finding "ghactions" "high" "Suspicious trivy-action ref" "${wf}:${line_num} ref=${ref}" "Pin to safe ref"
                     ((findings++))
                 fi
             fi
 
-            # Check Checkmarx/kics-github-action (v1 through v2.1.20 all hijacked)
+            # Check Checkmarx/kics-github-action (v1.x all hijacked, v2.0.0-v2.1.20 hijacked)
             if [ "$action_lower" = "checkmarx/kics-github-action" ]; then
-                if echo "$ref" | command grep -qE '^v[12](\.|$)'; then
-                    log_critical "${wf}:${line_num} - uses: ${action}@${ref}" "KICS action tags v1-v2.1.20 were all hijacked" "Pin to verified SHA after v2.1.20 or remove"
+                if echo "$ref" | command grep -qE '^v1(\.|$)'; then
+                    log_critical "${wf}:${line_num} - uses: ${action}@${ref}" "KICS action v1.x tags were all hijacked" "Pin to verified SHA after v2.1.20 or remove"
+                    add_json_finding "ghactions" "critical" "Hijacked KICS action@${ref}" "${wf}:${line_num}" "Update to post-compromise version"
+                    ((findings++))
+                elif echo "$ref" | command grep -qE '^v2\.(0\.|1\.(([0-9]|1[0-9]|20)(\.|$)))'; then
+                    log_critical "${wf}:${line_num} - uses: ${action}@${ref}" "KICS action v2.0.0-v2.1.20 were hijacked" "Pin to verified SHA after v2.1.20 or remove"
                     add_json_finding "ghactions" "critical" "Hijacked KICS action@${ref}" "${wf}:${line_num}" "Update to post-compromise version"
                     ((findings++))
                 fi
@@ -828,6 +861,7 @@ scan_github_actions() {
         # Check for appleboy/scp-action@master (used in trivy injection)
         if command grep -qi "appleboy/scp-action@master" "$wf" 2>/dev/null; then
             log_medium "appleboy/scp-action@master found: $wf" "Used in TeamPCP trivy injection chain"
+            add_json_finding "ghactions" "medium" "appleboy/scp-action@master in $wf" "Used in TeamPCP injection chain" "Pin to specific version"
             ((findings++))
         fi
 
@@ -941,6 +975,7 @@ scan_network() {
             fi
             if command grep -q "Python-urllib" "$logfile" 2>/dev/null; then
                 log_medium "Python-urllib User-Agent in: $logfile" "May indicate automated credential theft"
+                add_json_finding "network" "medium" "Python-urllib in $logfile" "May indicate automated theft" "Investigate"
                 ((findings++))
                 ((log_findings++))
             fi
@@ -1022,6 +1057,7 @@ scan_kubernetes() {
             | command grep -B10 "alpine:latest" 2>/dev/null | command grep '"name"' | head -5)
         if [ -n "$suspicious_ds" ]; then
             log_medium "DaemonSet in kube-system using alpine:latest" "$suspicious_ds"
+            add_json_finding "kubernetes" "medium" "Alpine DaemonSet in kube-system" "$suspicious_ds" "Inspect DaemonSet"
             ((findings++))
         fi
 
@@ -1100,7 +1136,10 @@ scan_openvsx() {
         local ext_list
         ext_list=$(code --list-extensions --show-versions 2>/dev/null)
         if echo "$ext_list" | command grep -qi "ast-results@2.53.0\|cx-dev-assist@1.7.0"; then
-            log_critical "Malicious extension installed (via code CLI)" "$(echo "$ext_list" | command grep -i 'ast-results\|cx-dev-assist')" "code --uninstall-extension <id>"
+            local ext_match
+            ext_match=$(echo "$ext_list" | command grep -i 'ast-results\|cx-dev-assist')
+            log_critical "Malicious extension installed (via code CLI)" "$ext_match" "code --uninstall-extension <id>"
+            add_json_finding "openvsx" "critical" "Malicious extension via code CLI" "$ext_match" "code --uninstall-extension"
             ((findings++))
         fi
     fi
@@ -1167,6 +1206,11 @@ write_json_report() {
     [ "$TOTAL_CRITICAL" -gt 0 ] && status="compromised"
     [ "$TOTAL_CRITICAL" -eq 0 ] && [ "$TOTAL_HIGH" -gt 0 ] && status="suspicious"
 
+    local escaped_scan_path escaped_hostname escaped_scanners
+    escaped_scan_path=$(json_escape "$SCAN_PATH")
+    escaped_hostname=$(json_escape "$(hostname)")
+    escaped_scanners=$(json_escape "$SCANNERS_TO_RUN")
+
     cat > "$JSON_OUTPUT" << JSONEOF
 {
   "scan_metadata": {
@@ -1175,10 +1219,10 @@ write_json_report() {
     "campaign": "TeamPCP March 2026",
     "scan_timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
     "scan_duration_sec": ${duration},
-    "hostname": "$(hostname)",
+    "hostname": "${escaped_hostname}",
     "platform": "$(uname -s)",
-    "scan_path": "${SCAN_PATH}",
-    "scanners_run": "${SCANNERS_TO_RUN}"
+    "scan_path": "${escaped_scan_path}",
+    "scanners_run": "${escaped_scanners}"
   },
   "summary": {
     "status": "${status}",
@@ -1239,12 +1283,12 @@ HELPEOF
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -p|--scan-path)   SCAN_PATH="$2"; shift 2 ;;
-            -o|--json-output) JSON_OUTPUT="$2"; shift 2 ;;
-            -s|--scanners)    SCANNERS_TO_RUN="$2"; shift 2 ;;
+            -p|--scan-path)   [ $# -lt 2 ] && { printf "Error: %s requires an argument\n" "$1" >&2; exit 1; }; SCAN_PATH="$2"; shift 2 ;;
+            -o|--json-output) [ $# -lt 2 ] && { printf "Error: %s requires an argument\n" "$1" >&2; exit 1; }; JSON_OUTPUT="$2"; shift 2 ;;
+            -s|--scanners)    [ $# -lt 2 ] && { printf "Error: %s requires an argument\n" "$1" >&2; exit 1; }; SCANNERS_TO_RUN="$2"; shift 2 ;;
             --no-color)       NO_COLOR=1; RED='' RED_BG='' YELLOW='' GREEN='' CYAN='' DIM='' BOLD='' RESET=''; shift ;;
             --no-dns)         NO_DNS=1; shift ;;
-            --log-path)       LOG_PATH="$2"; shift 2 ;;
+            --log-path)       [ $# -lt 2 ] && { printf "Error: %s requires an argument\n" "$1" >&2; exit 1; }; LOG_PATH="$2"; shift 2 ;;
             -v|--verbose)     VERBOSE=1; shift ;;
             -q|--quiet)       QUIET=1; shift ;;
             -h|--help)        show_help; exit 0 ;;
@@ -1274,6 +1318,17 @@ main() {
             printf "${RED}Error: Cannot write to: %s${RESET}\n" "$json_dir"
             exit 1
         fi
+    fi
+
+    # Validate scanner names
+    if [ "$SCANNERS_TO_RUN" != "all" ]; then
+        local valid_scanners="filesystem,pypi,npm,docker,ghactions,network,kubernetes,openvsx"
+        IFS=',' read -ra requested <<< "$SCANNERS_TO_RUN"
+        for s in "${requested[@]}"; do
+            if ! echo ",$valid_scanners," | command grep -q ",$s,"; then
+                printf "${YELLOW}Warning: Unknown scanner '%s' (valid: %s)${RESET}\n" "$s" "$valid_scanners" >&2
+            fi
+        done
     fi
 
     # Detect environment
