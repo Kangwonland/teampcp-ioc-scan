@@ -19,7 +19,7 @@
 - **Actor**: TeamPCP
 - **Strings**: `TeamPCP`, `TeamPCP Cloud stealer`, `tpcp.tar.gz`, `TeamPCP Owns Aqua Security.`
 - **GitHub accounts**: `Argon-DevOps-Mgt`, `aqua-bot`, `cx-plugins-releases`
-- **Advisory IDs**: GHSA-69fq-xp46-6x23 (Trivy), PYSEC-2026-2 (LiteLLM)
+- **Advisory IDs**: GHSA-69fq-xp46-6x23 / CVE-2026-33634 (Trivy), PYSEC-2026-2 (LiteLLM)
 
 ---
 
@@ -27,20 +27,26 @@
 
 | Date (UTC) | Event | Source |
 |------------|-------|--------|
-| **Mar 19, ~17:43** | `setup-trivy`, `trivy-action` tags force-pushed (76/77 tags) | StepSecurity |
-| **Mar 19, 18:22** | Malicious `trivy` v0.69.4 published to Docker Hub, GHCR, ECR | Datadog |
-| **Mar 19, ~21:31** | `aquasecurity/tfsec` compromised; curl exfil to Cloudflare tunnel | StepSecurity |
-| **Mar 19, ~21:35** | `traceeshark`, `trivy-action` additional workflow injections | StepSecurity |
-| **Mar 19, ~21:42** | trivy v0.69.4 exposure closed (~3h window) | StepSecurity |
-| **Mar 20, 00:08** | ~100 spam bot accounts flood Trivy discussion #10420 | Datadog |
-| **Mar 20-22** | **CanisterWorm** npm worm propagates; 28 @emilgroup pkgs in <60s | Aikido, JFrog |
-| **Mar 22, 15:43** | `aquasec/trivy:0.69.5` pushed to Docker Hub | Datadog |
-| **Mar 22, 16:34** | `aquasec/trivy:0.69.6` pushed to Docker Hub | Datadog |
-| **Mar 22, 20:31** | `Argon-DevOps-Mgt` defacement: 44 Aqua repos renamed `tpcp-docs-*` | Datadog |
-| **Mar 23, 12:58** | Checkmarx KICS/AST GitHub Actions compromised (35 tags) | Wiz |
-| **Mar 23, 14:31** | `krrishdholakia` PAT used to push malicious workflows to litellm repos | Datadog |
-| **Mar 24** | **litellm 1.82.7, 1.82.8** published to PyPI | Datadog |
-| **Mar 24, 12:44** | ~125 spam bot accounts target LiteLLM issue #24512 | Datadog |
+| **Mar 19, ~17:43** | `setup-trivy`, `trivy-action` tags force-pushed (76/77 tags) | [StepSecurity][ss] |
+| **Mar 19, 18:22** | Malicious `trivy` v0.69.4 published to Docker Hub, GHCR, ECR | [Datadog][dd] |
+| **Mar 19, ~21:31** | `aquasecurity/tfsec` compromised; curl exfil to Cloudflare tunnel | [StepSecurity][ss] |
+| **Mar 19, ~21:35** | `traceeshark`, `trivy-action` additional workflow injections | [StepSecurity][ss] |
+| **Mar 19, ~21:42** | trivy v0.69.4 exposure closed (~3h window) | [StepSecurity][ss] |
+| **Mar 20, 00:08** | ~100 spam bot accounts flood Trivy discussion #10420 | [Datadog][dd] |
+| **Mar 20-22** | **CanisterWorm** npm worm propagates; 28 @emilgroup pkgs in <60s | [Aikido][ai], [JFrog][jf] |
+| **Mar 22, 15:43** | `aquasec/trivy:0.69.5` pushed to Docker Hub | [Datadog][dd] |
+| **Mar 22, 16:34** | `aquasec/trivy:0.69.6` pushed to Docker Hub | [Datadog][dd] |
+| **Mar 22, 20:31** | `Argon-DevOps-Mgt` defacement: 44 Aqua repos renamed `tpcp-docs-*` | [Datadog][dd] |
+| **Mar 23, 12:58** | Checkmarx KICS/AST GitHub Actions compromised (35 tags) | [Wiz][wz] |
+| **Mar 23, 14:31** | `krrishdholakia` PAT used to push malicious workflows to litellm repos | [Datadog][dd] |
+| **Mar 24** | **litellm 1.82.7, 1.82.8** published to PyPI | [Datadog][dd] |
+| **Mar 24, 12:44** | ~125 spam bot accounts target LiteLLM issue #24512 | [Datadog][dd] |
+
+[dd]: https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-teampcp-supply-chain-campaign/
+[ss]: https://www.stepsecurity.io/blog/trivy-compromised-a-second-time---malicious-v0-69-4-release
+[ai]: https://www.aikido.dev/blog/teampcp-deploys-worm-npm-trivy-compromise
+[jf]: https://research.jfrog.com/post/canister-worm/
+[wz]: https://www.wiz.io/blog/teampcp-attack-kics-github-action
 
 ---
 
@@ -79,7 +85,7 @@
 
 ### 3.2 Docker/GitHub Actions - Trivy
 
-**Source**: StepSecurity blog, [GHSA-69fq-xp46-6x23](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23)
+**Source**: [StepSecurity](https://www.stepsecurity.io/blog/trivy-compromised-a-second-time---malicious-v0-69-4-release), [Wiz.io](https://www.wiz.io/blog/trivy-compromised-teampcp-supply-chain-attack), [GHSA-69fq-xp46-6x23 / CVE-2026-33634](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23)
 
 **Initial Access**: 탈취된 자격증명으로 Aqua Security의 trivy 리포지토리에 접근.
 
@@ -123,7 +129,7 @@
 
 ### 3.3 GitHub Actions - Checkmarx KICS/AST
 
-**Source**: Wiz.io KICS blog, Datadog
+**Source**: [Wiz.io](https://www.wiz.io/blog/teampcp-attack-kics-github-action), [Datadog](https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-teampcp-supply-chain-campaign/)
 
 **Initial Access**: `cx-plugins-releases` (ID: 225848595) 계정 사용.
 
@@ -144,7 +150,7 @@
 
 ### 3.4 npm - CanisterWorm
 
-**Source**: Aikido.dev, JFrog, StepSecurity
+**Source**: [Aikido.dev](https://www.aikido.dev/blog/teampcp-deploys-worm-npm-trivy-compromise), [JFrog](https://research.jfrog.com/post/canister-worm/), [ramimac](https://ramimac.me/teampcp/)
 
 **Mechanism**: 자가 전파 npm 웜. 탈취된 npm 토큰으로 패키지 게시 권한을 획득하여 패치 버전을 올리고 악성 코드를 주입.
 
@@ -160,10 +166,10 @@
 - Motoko 기반 메서드: `get_latest_link`, `http_request`, `update_link`
 - ~50분 폴링 간격, 5분 초기 대기
 
-**npm Worm Code Indicators**:
+**npm Worm Code Indicators** (Source: [Aikido](https://www.aikido.dev/blog/teampcp-deploys-worm-npm-trivy-compromise), [ramimac](https://ramimac.me/teampcp/)):
 - 함수명: `findNpmTokens()`, `g()`, `e(l)`, `bumpPatch()`, `getOwnedPackages()`, `deployWithToken()`
 - `BASE64_PAYLOAD` 상수 (Python 백도어)
-- YouTube.com 연결 확인을 킬 스위치로 사용
+- YouTube.com 연결 확인을 킬 스위치로 사용 (canister가 YouTube URL을 반환하면 dormant 상태)
 
 **Kubernetes Payload** (감염된 환경에서 K8s 접근 시):
 
@@ -178,7 +184,7 @@ K8s 스펙:
 - Tolerations: `operator: Exists` (모든 노드 배포)
 - HostPath: `/` -> `/mnt/host`
 
-**Steganography** (v3.3):
+**Steganography** (v3.3, Source: [ramimac](https://ramimac.me/teampcp/)):
 - WAV 파일에 Base64 인코딩된 Python 모듈 삽입
 - 8-bit mono, 44100 Hz RIFF WAV
 - `bg_kube.wav`, `bg_prop.wav`
@@ -197,7 +203,7 @@ K8s 스펙:
 
 ### 3.5 OpenVSX Extensions
 
-**Source**: Datadog
+**Source**: [Datadog](https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-teampcp-supply-chain-campaign/), [Wiz.io](https://www.wiz.io/blog/teampcp-attack-kics-github-action)
 
 - `ast-results` v2.53.0 (SHA256: `65bd72fcddaf938cefdf55b3323ad29f649a65d4ddd6aea09afa974dfc7f105d`)
 - `cx-dev-assist` v1.7.0 (SHA256: `744c9d61b66bcd2bb5474d9afeee6c00bb7e0cd32535781da188b80eb59383e0`)
@@ -239,6 +245,8 @@ K8s 스펙:
 | `/etc/systemd/system/pgmonitor.service` | Kamikaze v3 | Systemd unit |
 
 ### 4.3 Malicious npm Packages (55)
+
+Source: [Aikido](https://www.aikido.dev/blog/teampcp-deploys-worm-npm-trivy-compromise) (초기 발견), [JFrog](https://research.jfrog.com/post/canister-worm/) (전체 패키지 목록)
 
 <details>
 <summary>Full list (click to expand)</summary>
@@ -401,19 +409,20 @@ chmod +x teampcp_scan.sh
 
 ## 8. References
 
-### Primary Source
-- **Datadog Security Labs**: [litellm-compromised-pypi-teampcp-supply-chain-campaign](https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-teampcp-supply-chain-campaign/)
-
-### Additional Sources
-- **StepSecurity**: Trivy compromise analysis
-- **Aikido.dev**: CanisterWorm npm worm analysis, Kubernetes/Iran payload
-- **Wiz.io**: KICS GitHub Action compromise
-- **JFrog**: CanisterWorm research
-- **ramimac.me/teampcp**: Comprehensive timeline
+### Primary Sources
+- **Datadog Security Labs**: [LiteLLM Compromised – TeamPCP Supply Chain Campaign](https://securitylabs.datadoghq.com/articles/litellm-compromised-pypi-teampcp-supply-chain-campaign/)
+- **StepSecurity**: [Trivy Compromised a Second Time – Malicious v0.69.4 Release](https://www.stepsecurity.io/blog/trivy-compromised-a-second-time---malicious-v0-69-4-release)
+- **Aikido.dev**: [TeamPCP Deploys Worm: npm & Trivy Compromise](https://www.aikido.dev/blog/teampcp-deploys-worm-npm-trivy-compromise)
+- **Wiz.io**:
+  - [TeamPCP Attack: KICS GitHub Action](https://www.wiz.io/blog/teampcp-attack-kics-github-action)
+  - [Trivy Compromised: TeamPCP Supply Chain Attack](https://www.wiz.io/blog/trivy-compromised-teampcp-supply-chain-attack)
+  - [Three's a Crowd: TeamPCP Trojanizes LiteLLM](https://www.wiz.io/blog/threes-a-crowd-teampcp-trojanizes-litellm-in-continuation-of-campaign)
+- **JFrog**: [CanisterWorm Research](https://research.jfrog.com/post/canister-worm/)
+- **ramimac**: [TeamPCP Timeline](https://ramimac.me/teampcp/)
 
 ### Advisories
-- [GHSA-69fq-xp46-6x23](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23) (Trivy)
-- PYSEC-2026-2 (LiteLLM)
+- [GHSA-69fq-xp46-6x23 / CVE-2026-33634](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23) (Trivy)
+- [PYSEC-2026-2](https://github.com/pypa/advisory-database/blob/main/vulns/litellm/PYSEC-2026-2.yaml) (LiteLLM)
 
 ### Datadog Detection Queries
 
